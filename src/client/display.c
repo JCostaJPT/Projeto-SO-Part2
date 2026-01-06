@@ -61,6 +61,7 @@ void draw_board_client(Board board) {
     } else {
         mvprintw(1, 0, " Use W/A/S/D to move | Q to quit");
     }
+    attroff(COLOR_PAIR(5));
 
     // Starting row for the game board (leave space for UI)
     int start_row = 3;

@@ -14,14 +14,13 @@
 
 Board board;
 bool stop_execution = false;
-int tempo;
+int tempo = 200; // default until first board update arrives
 pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
 
 static void *receiver_thread(void *arg) {
     (void)arg;
 
     while (true) {
-        
         Board board = receive_board_update();
 
         if (!board.data || board.game_over == 1){
@@ -31,12 +30,19 @@ static void *receiver_thread(void *arg) {
             break;
         }
 
+        fprintf(stderr, "[client] board %dx%d tempo=%d victory=%d game_over=%d points=%d\n",
+                board.width, board.height, board.tempo, board.victory, board.game_over, board.accumulated_points);
+
         pthread_mutex_lock(&mutex);
         tempo = board.tempo;
         pthread_mutex_unlock(&mutex);
 
         draw_board_client(board);
         refresh_screen();
+
+        if (board.data) {
+            free(board.data);
+        }
     }
 
     debug("Returning receiver thread...\n");
@@ -85,7 +91,8 @@ int main(int argc, char *argv[]) {
 
     terminal_init();
     set_timeout(500);
-    draw_board_client(board);
+    // initial empty screen
+    clear();
     refresh_screen();
 
     char command;
@@ -135,12 +142,22 @@ int main(int argc, char *argv[]) {
 
         if (command == 'Q') {
             debug("Client pressed 'Q', quitting game\n");
+            fprintf(stderr, "[client] quitting by user\n");
             break;
         }
 
         debug("Command: %c\n", command);
+        fprintf(stderr, "[client] send command %c\n", command);
 
         pacman_play(command);
+
+        // Throttle to server tick to avoid flooding the pipe and freezing the UI
+        pthread_mutex_lock(&mutex);
+        int wait_for = tempo;
+        pthread_mutex_unlock(&mutex);
+        if (wait_for > 0) {
+            sleep_ms(wait_for);
+        }
 
     }
 

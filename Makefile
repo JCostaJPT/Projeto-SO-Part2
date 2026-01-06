@@ -18,11 +18,12 @@ CLIENT = client
 #Server objects
 OBJS_SERVER = game.o board.o parser.o display.o
 
-#Client objects
-OBJS_CLIENT = client_main.o debug.o api.o display.o
+#Client objects (use dedicated client display implementation)
+OBJS_CLIENT = client_main.o debug.o api.o client_display.o
 
 # Dependencies
 display.o = display.h
+client_display.o = display.h api.h
 board.o = board.h
 parser.o = parser.h
 api.o = api.h protocol.h
@@ -46,6 +47,10 @@ $(BIN_DIR)/$(TARGET): $(OBJS_SERVER) | folders
 
 # dont include LDFLAGS in the end, to allow compilation on macos
 %.o: %.c $($@) | folders
+	$(CC) -I $(INCLUDE_DIR) $(CFLAGS) -o $(OBJ_DIR)/$@ -c $<
+
+# Explicit rule so client display builds from src/client/display.c
+client_display.o: $(CLIENT_DIR)/display.c $($@)
 	$(CC) -I $(INCLUDE_DIR) $(CFLAGS) -o $(OBJ_DIR)/$@ -c $<
 
 # Create folders

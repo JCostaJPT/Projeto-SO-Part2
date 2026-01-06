@@ -8,6 +8,7 @@
 #include <stdio.h>
 #include <sys/stat.h>
 #include <stdlib.h>
+#include <errno.h>
 
 
 struct Session {
@@ -23,17 +24,34 @@ static struct Session session = {.id = -1};
 int pacman_connect(char const *req_pipe_path, char const *notif_pipe_path, char const *server_pipe_path) {
   if (session.id != -1) return 1; // already connected
 
+  fprintf(stderr, "[client] connecting via %s (req=%s notif=%s)\n", server_pipe_path, req_pipe_path, notif_pipe_path);
+
   // Remove existing FIFOs if any
   unlink(req_pipe_path);
   unlink(notif_pipe_path);
 
   // Create FIFOs
-  if (mkfifo(req_pipe_path, 0666) == -1) return 1;
-  if (mkfifo(notif_pipe_path, 0666) == -1) return 1;
+  if (mkfifo(req_pipe_path, 0666) == -1) { perror("mkfifo req"); return 1; }
+  if (mkfifo(notif_pipe_path, 0666) == -1) { perror("mkfifo notif"); return 1; }
 
-  // Open server pipe for writing
-  int server_fd = open(server_pipe_path, O_WRONLY);
-  if (server_fd == -1) return 1;
+  // Open server pipe for writing (non-blocking retry if server not yet listening)
+  int server_fd = -1;
+  fprintf(stderr, "[client] opening server pipe (nonblock)...\n");
+  for (int attempt = 0; attempt < 100; attempt++) {
+    server_fd = open(server_pipe_path, O_WRONLY | O_NONBLOCK);
+    if (server_fd != -1) break;
+    if (errno == ENXIO || errno == ENOENT) {
+      sleep_ms(50);
+      continue;
+    }
+    perror("open server pipe");
+    return 1;
+  }
+  if (server_fd == -1) {
+    fprintf(stderr, "[client] failed to open server pipe after retries\n");
+    return 1;
+  }
+  fprintf(stderr, "[client] server pipe opened\n");
 
   // Prepare message
   char message[1 + MAX_PIPE_PATH_LENGTH + MAX_PIPE_PATH_LENGTH];
@@ -45,26 +63,46 @@ int pacman_connect(char const *req_pipe_path, char const *notif_pipe_path, char 
   for (int i = strlen(notif_pipe_path); i < MAX_PIPE_PATH_LENGTH; i++) message[1 + MAX_PIPE_PATH_LENGTH + i] = '\0';
 
   // Send request
-  if (write(server_fd, message, sizeof(message)) == -1) {
+  ssize_t w = write(server_fd, message, sizeof(message));
+  if (w == -1) {
     close(server_fd);
     return 1;
   }
+  fprintf(stderr, "[client] sent %zd bytes connect msg\n", w);
   close(server_fd);
 
-  // Open notification pipe for reading
-  int notif_fd = open(notif_pipe_path, O_RDONLY);
-  if (notif_fd == -1) return 1;
+  // Open notification pipe for reading (blocking; will wait for server writer)
+  int notif_fd = -1;
+  for (int attempt = 0; attempt < 100; attempt++) {
+    notif_fd = open(notif_pipe_path, O_RDONLY);
+    if (notif_fd != -1) break;
+    if (errno == ENOENT) {
+      sleep_ms(50);
+      continue;
+    }
+    perror("open notif pipe");
+    return 1;
+  }
+  if (notif_fd == -1) {
+    fprintf(stderr, "[client] failed to open notif pipe after retries\n");
+    return 1;
+  }
+  fprintf(stderr, "[client] notif pipe opened\n");
 
   // Read response
   char response[2];
-  if (read(notif_fd, response, 2) != 2 || response[0] != OP_CODE_CONNECT || response[1] != 0) {
+  ssize_t r = read(notif_fd, response, 2);
+  fprintf(stderr, "[client] read connect resp bytes=%zd code=%d res=%d\n", r, response[0], response[1]);
+  if (r != 2 || response[0] != OP_CODE_CONNECT || response[1] != 0) {
     close(notif_fd);
+    perror("read connect response");
     return 1;
   }
 
   // Open request pipe for writing
   int req_fd = open(req_pipe_path, O_WRONLY);
   if (req_fd == -1) {
+    perror("open req pipe");
     close(notif_fd);
     return 1;
   }
@@ -118,7 +156,10 @@ Board receive_board_update(void) {
 
     char header[1 + 4*6]; // OP + 5 ints + points int
     int bytes_read = read(session.notif_pipe, header, sizeof(header));
-    if (bytes_read != sizeof(header) || header[0] != OP_CODE_BOARD) return board;
+    if (bytes_read != sizeof(header) || header[0] != OP_CODE_BOARD) {
+      perror("read notif header");
+      return board;
+    }
 
     int offset = 1;
     board.width = *(int*)(header + offset); offset += 4;

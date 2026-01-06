@@ -9,7 +9,7 @@
 #include <stdarg.h>
 #include <pthread.h>
 
-FILE * debugfile;
+FILE *debugfile = NULL;
 
 // Helper private function to find and kill pacman at specific position
 static int find_and_kill_pacman(board_t* board, int new_x, int new_y) {
@@ -133,6 +133,7 @@ int move_pacman(board_t* board, int pacman_index, command_t* command) {
     if (board->board[new_index].has_dot) {
         pac->points++;
         board->board[new_index].has_dot = 0;
+        board->accumulated_points = pac->points;
     }
 
     board->board[old_index].content = ' ';
@@ -444,6 +445,7 @@ void kill_pacman(board_t* board, int pacman_index) {
 
     // Mark pacman as dead
     pac->alive = 0;
+    board->game_over = 1;
 }
 
 // Static Loading
@@ -473,6 +475,10 @@ int load_level(board_t *board, char *filename, char* dirname, int points) {
         printf("Failed to load level\n");
         return -1;
     }
+
+    board->accumulated_points = points;
+    board->victory = 0;
+    board->game_over = 0;
 
     if (read_pacman(board, points) < 0) {
         printf("Failed to load the pacman\n");
@@ -507,10 +513,18 @@ void open_debug_file(char *filename) {
 }
 
 void close_debug_file() {
-    fclose(debugfile);
+    if (debugfile && debugfile != stderr) {
+        fclose(debugfile);
+    }
+    debugfile = NULL;
 }
 
 void debug(const char * format, ...) {
+    // Fallback to stderr if no debug file configured to avoid null deref
+    if (!debugfile) {
+        debugfile = stderr;
+    }
+
     va_list args;
     va_start(args, format);
     vfprintf(debugfile, format, args);

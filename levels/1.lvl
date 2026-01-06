@@ -1,0 +1,15 @@
+# DIM: dimensoes da matriz do nivel
+DIM 6 6
+# TEMPO: duracao de cada jogada em milissegundos
+TEMPO 200
+# PAC: ficheiro do pacman
+#PAC 1.p
+# MON: ficheiros dos monstros
+MON 1.m 3.m
+# matriz de jogo
+XXoXXX
+XoooXX
+XoXoXX
+Xooo@X
+XooooX
+XXXXXX
