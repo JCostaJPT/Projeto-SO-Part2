@@ -181,3 +181,63 @@ void terminal_cleanup() {
     // Restore terminal settings and clean up ncurses
     endwin();
 }
+
+void set_timeout(int ms) {
+    timeout(ms);
+}
+
+void draw_board_client(Board board) {
+    // Clear the screen before redrawing
+    clear();
+
+    // Draw the border/title
+    attron(COLOR_PAIR(5));
+    mvprintw(0, 0, "=== PACMAN CLIENT ===");
+    mvprintw(1, 0, "Points: %d | Victory: %d | Game Over: %d", board.accumulated_points, board.victory, board.game_over);
+
+    // Starting row for the game board
+    int start_row = 3;
+
+    // Draw the board
+    for (int y = 0; y < board.height; y++) {
+        for (int x = 0; x < board.width; x++) {
+            int index = y * board.width + x;
+            char ch = board.data[index];
+
+            // Move cursor to position
+            move(start_row + y, x);
+
+            // Draw with appropriate color
+            switch (ch) {
+                case 'W': // Wall
+                    attron(COLOR_PAIR(3));
+                    addch('#');
+                    attroff(COLOR_PAIR(3));
+                    break;
+
+                case 'P': // Pacman
+                    attron(COLOR_PAIR(1) | A_BOLD);
+                    addch('C');
+                    attroff(COLOR_PAIR(1) | A_BOLD);
+                    break;
+
+                case 'M': // Monster/Ghost
+                    attron(COLOR_PAIR(2) | A_BOLD);
+                    addch('M');
+                    attroff(COLOR_PAIR(2) | A_BOLD);
+                    break;
+
+                case ' ': // Empty space
+                    addch(' ');
+                    break;
+
+                default:
+                    addch(ch);
+                    break;
+            }
+        }
+    }
+
+    // Update the physical screen
+    refresh();
+}

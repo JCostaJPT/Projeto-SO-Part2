@@ -1,5 +1,6 @@
 #include "board.h"
 #include "parser.h"
+#include "debug.h"
 #include <stdlib.h>
 #include <stdio.h> //snprintf
 #include <fcntl.h>

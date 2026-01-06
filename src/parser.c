@@ -4,6 +4,7 @@
 #include <unistd.h>
 #include "parser.h"
 #include "board.h"
+#include "debug.h"
 #include <fcntl.h>
 
 int read_level(board_t* board, char* filename, char* dirname) {
