@@ -143,6 +143,9 @@ int main(int argc, char *argv[]) {
         if (command == 'Q') {
             debug("Client pressed 'Q', quitting game\n");
             fprintf(stderr, "[client] quitting by user\n");
+            pthread_mutex_lock(&mutex);
+            stop_execution = true;
+            pthread_mutex_unlock(&mutex);
             break;
         }
 
@@ -162,6 +165,9 @@ int main(int argc, char *argv[]) {
     }
 
     pacman_disconnect();
+
+    // In case receiver is blocked on read, cancel it so join won't hang
+    pthread_cancel(receiver_thread_id);
 
     pthread_join(receiver_thread_id, NULL);
 

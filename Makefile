@@ -1,7 +1,7 @@
 # Compiler variables
 CC = gcc
-CFLAGS = -g -Wall -Wextra -std=c17 -D_POSIX_C_SOURCE=200809L
-LDFLAGS = -lncurses -ltinfo
+CFLAGS = -g -Wall -Wextra -std=c17 -D_POSIX_C_SOURCE=200809L -pthread
+LDFLAGS = -lncurses -ltinfo -pthread
 
 # Directory variables
 OBJ_DIR = obj

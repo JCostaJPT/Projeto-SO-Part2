@@ -15,6 +15,7 @@
 #include <pthread.h>
 #include <sys/stat.h>
 #include <errno.h>
+#include <signal.h>
 
 #define CONTINUE_PLAY 0
 #define NEXT_LEVEL 1
@@ -22,12 +23,37 @@
 #define LOAD_BACKUP 3
 #define CREATE_BACKUP 4
 
+static const char *LEVEL_FILES[] = {"1.lvl", "2.lvl"};
+static const int NUM_LEVELS = 2;
+
 typedef struct {
     board_t *board;
     int ghost_index;
 } ghost_thread_arg_t;
 
+typedef struct {
+    int req_fd;
+    int notif_fd;
+    char levels_dir[256];
+    int session_id;
+    char req_pipe[41];
+    char notif_pipe[41];
+} session_ctx_t;
+
+typedef struct {
+    char fifo_registo[256];
+    char levels_dir[256];
+    int max_games;
+} host_ctx_t;
+
 int thread_shutdown = 0;
+static pthread_mutex_t sessions_lock = PTHREAD_MUTEX_INITIALIZER;
+static int active_sessions = 0;
+static void dec_sessions(void) {
+    pthread_mutex_lock(&sessions_lock);
+    active_sessions--;
+    pthread_mutex_unlock(&sessions_lock);
+}
 
 static int count_remaining_dots(board_t *board) {
     int dots = 0;
@@ -39,11 +65,11 @@ static int count_remaining_dots(board_t *board) {
     return dots;
 }
 
-static void send_board_update(int notif_fd, board_t *board) {
+static int send_board_update(int notif_fd, board_t *board) {
     int data_size = board->width * board->height;
     int msg_size = 1 + 4 * 6 + data_size;
     char *msg = malloc(msg_size);
-    if (!msg) return;
+    if (!msg) return -1;
 
     msg[0] = OP_CODE_BOARD;
     int offset = 1;
@@ -97,9 +123,107 @@ cell_done:
 
     ssize_t w = write(notif_fd, msg, msg_size);
     if (w != msg_size) {
+        int saved = errno;
         perror("write notif board");
+        free(msg);
+        errno = saved;
+        return -1;
     }
     free(msg);
+    return 0;
+}
+
+static void* session_thread(void *arg) {
+    session_ctx_t *ctx = (session_ctx_t *)arg;
+
+    int carry_points = 0;
+
+    for (int level_idx = 0; level_idx < NUM_LEVELS; level_idx++) {
+        board_t board;
+        memset(&board, 0, sizeof(board));
+
+        if (load_level(&board, (char *)LEVEL_FILES[level_idx], ctx->levels_dir, carry_points) != 0) {
+            fprintf(stderr, "[server] session %d failed to load level %s\n", ctx->session_id, LEVEL_FILES[level_idx]);
+            goto cleanup;
+        }
+
+        fprintf(stderr, "[server] session %d level loaded: %s (%dx%d) tempo=%d dots=%d\n",
+                ctx->session_id, board.level_name, board.width, board.height, board.tempo, count_remaining_dots(&board));
+
+        // Main session loop for this level
+        while (!board.game_over && !board.victory) {
+            char buf[32];
+            ssize_t n = read(ctx->req_fd, buf, sizeof(buf));
+            if (n == 0) {
+                board.game_over = 1; // client closed
+            } else if (n > 0) {
+                fprintf(stderr, "[server] session %d got %zd bytes from client\n", ctx->session_id, n);
+                for (ssize_t i = 0; i + 1 < n; i += 2) {
+                    if (buf[i] != OP_CODE_PLAY) continue;
+                    char cmd = toupper(buf[i + 1]);
+                    pthread_rwlock_wrlock(&board.state_lock);
+                    move_t res = move_pacman(&board, 0, &(command_t){.command = cmd, .turns = 1, .turns_left = 1});
+                    if (res == DEAD_PACMAN) {
+                        board.game_over = 1;
+                    } else if (res == REACHED_PORTAL) {
+                        board.victory = 1;
+                    }
+                    pthread_rwlock_unlock(&board.state_lock);
+                }
+            }
+
+            pthread_rwlock_wrlock(&board.state_lock);
+            // Move ghosts each tick
+            for (int g = 0; g < board.n_ghosts; g++) {
+                move_ghost(&board, g, &board.ghosts[g].moves[board.ghosts[g].current_move % board.ghosts[g].n_moves]);
+            }
+            // Victory check by dots
+            if (count_remaining_dots(&board) == 0) {
+                board.victory = 1;
+            }
+            pthread_rwlock_unlock(&board.state_lock);
+
+            pthread_rwlock_rdlock(&board.state_lock);
+            if (send_board_update(ctx->notif_fd, &board) == -1 && errno == EPIPE) {
+                pthread_rwlock_unlock(&board.state_lock);
+                board.game_over = 1;
+                break; // client closed pipe
+            }
+            pthread_rwlock_unlock(&board.state_lock);
+
+            sleep_ms(board.tempo);
+        }
+
+        // Finished this level: send final board for this level
+        pthread_rwlock_rdlock(&board.state_lock);
+        int has_next = (level_idx + 1) < NUM_LEVELS;
+        if (board.victory && has_next) {
+            board.game_over = 0; // signal transition, not final game over
+        } else {
+            board.game_over = 1;
+        }
+        if (send_board_update(ctx->notif_fd, &board) == -1 && errno == EPIPE) {
+            pthread_rwlock_unlock(&board.state_lock);
+            break;
+        }
+        pthread_rwlock_unlock(&board.state_lock);
+
+        carry_points = board.accumulated_points;
+        unload_level(&board);
+
+        if (board.victory && has_next) {
+            continue; // load next level
+        }
+        break; // either final game over or no more levels
+    }
+
+cleanup:
+    if (ctx->req_fd != -1) close(ctx->req_fd);
+    if (ctx->notif_fd != -1) close(ctx->notif_fd);
+    dec_sessions();
+    fprintf(stderr, "[server] session %d closed (req=%s notif=%s)\n", ctx->session_id, ctx->req_pipe, ctx->notif_pipe);
+    free(ctx);
+    return NULL;
 }
 
 int create_backup() {
@@ -231,7 +355,8 @@ void* ghost_thread(void *arg) {
 }
 
 void* host_thread_func(void *arg) {
-    char* fifo_registo = (char*)arg;
+    host_ctx_t *host_ctx = (host_ctx_t *)arg;
+    char *fifo_registo = host_ctx->fifo_registo;
     // Open FIFO in RDWR to keep both ends open and avoid ENXIO
     int reg_fd = open(fifo_registo, O_RDWR);
     if (reg_fd == -1) {
@@ -267,6 +392,24 @@ void* host_thread_func(void *arg) {
         strncpy(notif_pipe, message + 41, 40);
         notif_pipe[40] = '\0';
 
+        // Check capacity
+        int full;
+        pthread_mutex_lock(&sessions_lock);
+        full = active_sessions >= host_ctx->max_games;
+        pthread_mutex_unlock(&sessions_lock);
+
+        if (full) {
+            // Non-blocking open to avoid stalling host if client isn't ready
+            int notif_fd = open(notif_pipe, O_WRONLY | O_NONBLOCK);
+            if (notif_fd != -1) {
+                char resp_busy[2] = {OP_CODE_CONNECT, 1};
+                write(notif_fd, resp_busy, 2);
+                close(notif_fd);
+            }
+            fprintf(stderr, "[server] rejecting session (full) req=%s notif=%s\n", req_pipe, notif_pipe);
+            continue;
+        }
+
         int notif_fd = open(notif_pipe, O_WRONLY);
         if (notif_fd == -1) {
             continue;
@@ -280,68 +423,28 @@ void* host_thread_func(void *arg) {
         char response[2] = {OP_CODE_CONNECT, 0};
         write(notif_fd, response, 2);
 
-        fprintf(stderr, "[server] new session: req=%s notif=%s\n", req_pipe, notif_pipe);
-
-        board_t board;
-        memset(&board, 0, sizeof(board));
-
-        // Load first level in directory (default 1.lvl)
-        if (load_level(&board, "1.lvl", "levels", 0) != 0) {
+        session_ctx_t *ctx = calloc(1, sizeof(session_ctx_t));
+        if (!ctx) {
             close(req_fd);
             close(notif_fd);
             continue;
         }
+        ctx->req_fd = req_fd;
+        ctx->notif_fd = notif_fd;
+        strncpy(ctx->levels_dir, host_ctx->levels_dir, sizeof(ctx->levels_dir) - 1);
+        strncpy(ctx->req_pipe, req_pipe, sizeof(ctx->req_pipe) - 1);
+        strncpy(ctx->notif_pipe, notif_pipe, sizeof(ctx->notif_pipe) - 1);
 
-        fprintf(stderr, "[server] level loaded: %s (%dx%d) tempo=%d dots=%d\n",
-            board.level_name, board.width, board.height, board.tempo, count_remaining_dots(&board));
+        pthread_mutex_lock(&sessions_lock);
+        active_sessions++;
+        ctx->session_id = active_sessions;
+        pthread_mutex_unlock(&sessions_lock);
 
-        // Main session loop
-        while (!board.game_over && !board.victory) {
-            char buf[32];
-            ssize_t n = read(req_fd, buf, sizeof(buf));
-            if (n == 0) {
-                board.game_over = 1; // client closed
-            } else if (n > 0) {
-                fprintf(stderr, "[server] got %zd bytes from client\n", n);
-                for (ssize_t i = 0; i + 1 < n; i += 2) {
-                    if (buf[i] != OP_CODE_PLAY) continue;
-                    char cmd = toupper(buf[i + 1]);
-                    pthread_rwlock_wrlock(&board.state_lock);
-                    move_t res = move_pacman(&board, 0, &(command_t){.command = cmd, .turns = 1, .turns_left = 1});
-                    if (res == DEAD_PACMAN) {
-                        board.game_over = 1;
-                    }
-                    pthread_rwlock_unlock(&board.state_lock);
-                }
-            }
+        fprintf(stderr, "[server] new session %d: req=%s notif=%s\n", ctx->session_id, req_pipe, notif_pipe);
 
-            pthread_rwlock_wrlock(&board.state_lock);
-            // Move ghosts each tick
-            for (int g = 0; g < board.n_ghosts; g++) {
-                move_ghost(&board, g, &board.ghosts[g].moves[board.ghosts[g].current_move % board.ghosts[g].n_moves]);
-            }
-            // Victory check
-            if (count_remaining_dots(&board) == 0) {
-                board.victory = 1;
-                board.game_over = 1;
-            }
-            pthread_rwlock_unlock(&board.state_lock);
-
-            pthread_rwlock_rdlock(&board.state_lock);
-            send_board_update(notif_fd, &board);
-            pthread_rwlock_unlock(&board.state_lock);
-
-            sleep_ms(board.tempo);
-        }
-
-        pthread_rwlock_rdlock(&board.state_lock);
-        board.game_over = 1;
-        send_board_update(notif_fd, &board);
-        pthread_rwlock_unlock(&board.state_lock);
-
-        close(req_fd);
-        close(notif_fd);
-        unload_level(&board);
+        pthread_t session_thread_id;
+        pthread_create(&session_thread_id, NULL, session_thread, ctx);
+        pthread_detach(session_thread_id);
     }
 
     close(reg_fd);
@@ -358,10 +461,10 @@ int main(int argc, char** argv) {
     int max_games = atoi(argv[2]);
     char* fifo_registo = argv[3];
 
-    (void)levels_dir;
-    (void)max_games;
-
     fprintf(stderr, "[server] starting, fifo=%s levels_dir=%s max_games=%s\n", fifo_registo, argv[1], argv[2]);
+
+    // Avoid crashing on write to closed FIFOs
+    signal(SIGPIPE, SIG_IGN);
 
     // Create FIFO de registo (remove stale one first)
     unlink(fifo_registo);
@@ -372,12 +475,23 @@ int main(int argc, char** argv) {
 
     fprintf(stderr, "[server] fifo created\n");
 
+    host_ctx_t *ctx = calloc(1, sizeof(host_ctx_t));
+    if (!ctx) {
+        fprintf(stderr, "[server] failed to alloc host ctx\n");
+        return -1;
+    }
+    strncpy(ctx->fifo_registo, fifo_registo, sizeof(ctx->fifo_registo) - 1);
+    strncpy(ctx->levels_dir, levels_dir, sizeof(ctx->levels_dir) - 1);
+    ctx->max_games = max_games;
+
     // Create thread to handle connections
     pthread_t host_thread;
-    pthread_create(&host_thread, NULL, host_thread_func, (void*)fifo_registo);
+    pthread_create(&host_thread, NULL, host_thread_func, ctx);
 
     // Wait for thread
     pthread_join(host_thread, NULL);
+
+    free(ctx);
 
     // Cleanup
     unlink(fifo_registo);
