@@ -112,8 +112,14 @@ int pacman_connect(char const *req_pipe_path, char const *notif_pipe_path, char 
   session.notif_pipe = notif_fd;
   strcpy(session.req_pipe_path, req_pipe_path);
   strcpy(session.notif_pipe_path, notif_pipe_path);
-  // Dummy id, parse from path later
-  session.id = 1;
+
+  // Parse client_id from req_pipe_path
+  int client_id;
+  if (sscanf(req_pipe_path, "/tmp/%d_request", &client_id) == 1) {
+      session.id = client_id;
+  } else {
+      session.id = 1;  // Fallback
+  }
 
   return 0;
 }

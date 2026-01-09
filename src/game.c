@@ -16,12 +16,15 @@
 #include <sys/stat.h>
 #include <errno.h>
 #include <signal.h>
+#include <semaphore.h>
 
 #define CONTINUE_PLAY 0
 #define NEXT_LEVEL 1
 #define QUIT_GAME 2
 #define LOAD_BACKUP 3
 #define CREATE_BACKUP 4
+#define MAX_CLIENTS 25
+#define BUFFER_SIZE 25
 
 static const char *LEVEL_FILES[] = {"1.lvl", "2.lvl"};
 static const int NUM_LEVELS = 2;
@@ -30,6 +33,11 @@ typedef struct {
     board_t *board;
     int ghost_index;
 } ghost_thread_arg_t;
+
+typedef struct{
+    int client_id;
+    int points;
+} client_info_t;
 
 typedef struct {
     int req_fd;
@@ -45,6 +53,47 @@ typedef struct {
     char levels_dir[256];
     int max_games;
 } host_ctx_t;
+
+client_info_t active_clients [MAX_CLIENTS];
+int num_active_clients = 0;
+pthread_mutex_t clients_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+void add_client (int client_id){
+    pthread_mutex_lock(&clients_mutex);
+    if (num_active_clients < MAX_CLIENTS){
+        active_clients[num_active_clients].client_id = client_id;
+        active_clients[num_active_clients].points = 0;
+        num_active_clients++;
+    }
+    pthread_mutex_unlock(&clients_mutex);
+}
+
+void update_client_points(int client_id, int points){
+    pthread_mutex_lock(&clients_mutex);
+    for(int i = 0; i < num_active_clients; i++){
+        if (active_clients[i].client_id == client_id){
+            active_clients[i].points = points;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&clients_mutex);
+}
+
+void remove_client (int client_id){
+    pthread_mutex_lock(&clients_mutex);
+    for(int i = 0; i < num_active_clients; i++){
+        if (active_clients[i].client_id == client_id){
+            active_clients[i] = active_clients[--num_active_clients];
+            break;
+        }
+    }
+    pthread_mutex_unlock(&clients_mutex);
+}
+
+session_ctx_t *buffer[BUFFER_SIZE];
+int buffer_in = 0, buffer_out = 0;
+sem_t empty, full;
+pthread_mutex_t buffer_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 int thread_shutdown = 0;
 static pthread_mutex_t sessions_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -135,6 +184,11 @@ cell_done:
 
 static void* session_thread(void *arg) {
     session_ctx_t *ctx = (session_ctx_t *)arg;
+    sigset_t mask;
+    sigemptyset (&mask);
+    sigaddset(&mask, SIGUSR1);
+    pthread_sigmask(SIG_BLOCK, &mask, NULL);      
+
 
     int carry_points = 0;
 
@@ -354,6 +408,27 @@ void* ghost_thread(void *arg) {
     }
 }
 
+void* manager_thread_func(void *arg) {
+    (void)arg;
+    while (true) {
+        sem_wait(&full);
+        pthread_mutex_lock(&buffer_mutex);
+        session_ctx_t *ctx = buffer[buffer_out];
+        buffer_out = (buffer_out + 1) % BUFFER_SIZE;
+        pthread_mutex_unlock(&buffer_mutex);
+        sem_post(&empty);
+
+        // Increment active sessions
+        pthread_mutex_lock(&sessions_lock);
+        active_sessions++;
+        pthread_mutex_unlock(&sessions_lock);
+
+        // Handle the session
+        session_thread(ctx);
+    }
+    return NULL;
+}
+
 void* host_thread_func(void *arg) {
     host_ctx_t *host_ctx = (host_ctx_t *)arg;
     char *fifo_registo = host_ctx->fifo_registo;
@@ -392,21 +467,10 @@ void* host_thread_func(void *arg) {
         strncpy(notif_pipe, message + 41, 40);
         notif_pipe[40] = '\0';
 
-        // Check capacity
-        int full;
-        pthread_mutex_lock(&sessions_lock);
-        full = active_sessions >= host_ctx->max_games;
-        pthread_mutex_unlock(&sessions_lock);
-
-        if (full) {
-            // Non-blocking open to avoid stalling host if client isn't ready
-            int notif_fd = open(notif_pipe, O_WRONLY | O_NONBLOCK);
-            if (notif_fd != -1) {
-                char resp_busy[2] = {OP_CODE_CONNECT, 1};
-                write(notif_fd, resp_busy, 2);
-                close(notif_fd);
-            }
-            fprintf(stderr, "[server] rejecting session (full) req=%s notif=%s\n", req_pipe, notif_pipe);
+        // Parse client ID from pipe name
+        int client_id;
+        if (sscanf(req_pipe, "/tmp/%d_request", &client_id) != 1) {
+            fprintf(stderr, "[server] invalid pipe name %s\n", req_pipe);
             continue;
         }
 
@@ -434,21 +498,57 @@ void* host_thread_func(void *arg) {
         strncpy(ctx->levels_dir, host_ctx->levels_dir, sizeof(ctx->levels_dir) - 1);
         strncpy(ctx->req_pipe, req_pipe, sizeof(ctx->req_pipe) - 1);
         strncpy(ctx->notif_pipe, notif_pipe, sizeof(ctx->notif_pipe) - 1);
-
-        pthread_mutex_lock(&sessions_lock);
-        active_sessions++;
-        ctx->session_id = active_sessions;
-        pthread_mutex_unlock(&sessions_lock);
+        ctx->session_id = client_id;
 
         fprintf(stderr, "[server] new session %d: req=%s notif=%s\n", ctx->session_id, req_pipe, notif_pipe);
 
-        pthread_t session_thread_id;
-        pthread_create(&session_thread_id, NULL, session_thread, ctx);
-        pthread_detach(session_thread_id);
+        // Insert into buffer
+        sem_wait(&empty);
+        pthread_mutex_lock(&buffer_mutex);
+        buffer[buffer_in] = ctx;
+        buffer_in = (buffer_in + 1) % BUFFER_SIZE;
+        pthread_mutex_unlock(&buffer_mutex);
+        sem_post(&full);
     }
 
     close(reg_fd);
     return NULL;
+}
+
+static void sigusr1_handler (int sig){
+    (void)sig; //unused parameter
+
+    FILE *log_file = fopen("scores.log","w");
+    if (!log_file) return;
+
+    //lock mutex to safely read active clients
+    pthread_mutex_lock(&clients_mutex);
+
+    //find top 5 clients
+    client_info_t top5[5] = {0};
+
+    for (int i = 0; i < num_active_clients; i++){
+        //Compare with top 5 and insert if necessary
+        for (int j = 0; j < 5; j++){
+            if (active_clients[i].points > top5[j].points){
+                //Shift others down
+                for (int k = 4; k>j; k--){
+                    top5[k] = top5[k-1];
+                }
+                top5[j] = active_clients [i];
+                break;
+            }
+        }
+    }
+    //write to file
+    fprintf(log_file, "=== TOP 5 SCORES ===\n");
+    for (int i = 0; i < 5; i++){
+        if (top5[i].client_id != 0){
+            fprintf(log_file, "Client %d: %d points\n", top5[i].client_id, top5[i]. points);
+        }
+    }
+    pthread_mutex_unlock(&clients_mutex);
+    fclose(log_file);
 }
 
 int main(int argc, char** argv) {
@@ -465,6 +565,7 @@ int main(int argc, char** argv) {
 
     // Avoid crashing on write to closed FIFOs
     signal(SIGPIPE, SIG_IGN);
+    signal(SIGUSR1, sigusr1_handler);
 
     // Create FIFO de registo (remove stale one first)
     unlink(fifo_registo);
@@ -475,6 +576,10 @@ int main(int argc, char** argv) {
 
     fprintf(stderr, "[server] fifo created\n");
 
+    // Init semaphores
+    sem_init(&empty, 0, BUFFER_SIZE);
+    sem_init(&full, 0, 0);
+
     host_ctx_t *ctx = calloc(1, sizeof(host_ctx_t));
     if (!ctx) {
         fprintf(stderr, "[server] failed to alloc host ctx\n");
@@ -483,6 +588,12 @@ int main(int argc, char** argv) {
     strncpy(ctx->fifo_registo, fifo_registo, sizeof(ctx->fifo_registo) - 1);
     strncpy(ctx->levels_dir, levels_dir, sizeof(ctx->levels_dir) - 1);
     ctx->max_games = max_games;
+
+    // Create manager threads
+    pthread_t manager_threads[25];
+    for (int i = 0; i < max_games; i++) {
+        pthread_create(&manager_threads[i], NULL, manager_thread_func, NULL);
+    }
 
     // Create thread to handle connections
     pthread_t host_thread;
