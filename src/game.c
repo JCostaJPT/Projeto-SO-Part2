@@ -56,15 +56,58 @@ typedef struct {
 
 client_info_t active_clients [MAX_CLIENTS];
 int num_active_clients = 0;
+client_info_t best_clients[5];
 pthread_mutex_t clients_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+static void update_best_clients(int client_id, int points) {
+    // Update existing entry if present
+    for (int i = 0; i < 5; i++) {
+        if (best_clients[i].client_id == client_id) {
+            if (points > best_clients[i].points) {
+                best_clients[i].points = points;
+            }
+            // Reorder if needed
+            for (int j = i; j > 0; j--) {
+                if (best_clients[j].points > best_clients[j-1].points) {
+                    client_info_t tmp = best_clients[j-1];
+                    best_clients[j-1] = best_clients[j];
+                    best_clients[j] = tmp;
+                }
+            }
+            return;
+        }
+    }
+
+    // Insert if better than current entries
+    if (points <= 0) return;
+    for (int i = 0; i < 5; i++) {
+        if (best_clients[i].client_id == 0 || points > best_clients[i].points) {
+            for (int k = 4; k > i; k--) {
+                best_clients[k] = best_clients[k-1];
+            }
+            best_clients[i].client_id = client_id;
+            best_clients[i].points = points;
+            break;
+        }
+    }
+}
 
 void add_client (int client_id){
     pthread_mutex_lock(&clients_mutex);
+    for (int i = 0; i < num_active_clients; i++) {
+        if (active_clients[i].client_id == client_id) {
+            active_clients[i].points = 0;
+            pthread_mutex_unlock(&clients_mutex);
+            return;
+        }
+    }
+
     if (num_active_clients < MAX_CLIENTS){
         active_clients[num_active_clients].client_id = client_id;
         active_clients[num_active_clients].points = 0;
         num_active_clients++;
     }
+    update_best_clients(client_id, 0);
     pthread_mutex_unlock(&clients_mutex);
 }
 
@@ -73,6 +116,7 @@ void update_client_points(int client_id, int points){
     for(int i = 0; i < num_active_clients; i++){
         if (active_clients[i].client_id == client_id){
             active_clients[i].points = points;
+            update_best_clients(client_id, points);
             break;
         }
     }
@@ -238,12 +282,15 @@ static void* session_thread(void *arg) {
             pthread_rwlock_unlock(&board.state_lock);
 
             pthread_rwlock_rdlock(&board.state_lock);
+            int points_snapshot = board.accumulated_points;
             if (send_board_update(ctx->notif_fd, &board) == -1 && errno == EPIPE) {
                 pthread_rwlock_unlock(&board.state_lock);
                 board.game_over = 1;
                 break; // client closed pipe
             }
             pthread_rwlock_unlock(&board.state_lock);
+
+            update_client_points(ctx->session_id, points_snapshot);
 
             sleep_ms(board.tempo);
         }
@@ -256,11 +303,14 @@ static void* session_thread(void *arg) {
         } else {
             board.game_over = 1;
         }
+        int points_snapshot = board.accumulated_points;
         if (send_board_update(ctx->notif_fd, &board) == -1 && errno == EPIPE) {
             pthread_rwlock_unlock(&board.state_lock);
             break;
         }
         pthread_rwlock_unlock(&board.state_lock);
+
+        update_client_points(ctx->session_id, points_snapshot);
 
         carry_points = board.accumulated_points;
         unload_level(&board);
@@ -274,6 +324,7 @@ static void* session_thread(void *arg) {
 cleanup:
     if (ctx->req_fd != -1) close(ctx->req_fd);
     if (ctx->notif_fd != -1) close(ctx->notif_fd);
+    remove_client(ctx->session_id);
     dec_sessions();
     fprintf(stderr, "[server] session %d closed (req=%s notif=%s)\n", ctx->session_id, ctx->req_pipe, ctx->notif_pipe);
     free(ctx);
@@ -484,6 +535,8 @@ void* host_thread_func(void *arg) {
             continue;
         }
 
+        add_client(client_id);
+
         char response[2] = {OP_CODE_CONNECT, 0};
         write(notif_fd, response, 2);
 
@@ -521,30 +574,13 @@ static void sigusr1_handler (int sig){
     FILE *log_file = fopen("scores.log","w");
     if (!log_file) return;
 
-    //lock mutex to safely read active clients
+    //lock mutex to safely read best clients
     pthread_mutex_lock(&clients_mutex);
 
-    //find top 5 clients
-    client_info_t top5[5] = {0};
-
-    for (int i = 0; i < num_active_clients; i++){
-        //Compare with top 5 and insert if necessary
-        for (int j = 0; j < 5; j++){
-            if (active_clients[i].points > top5[j].points){
-                //Shift others down
-                for (int k = 4; k>j; k--){
-                    top5[k] = top5[k-1];
-                }
-                top5[j] = active_clients [i];
-                break;
-            }
-        }
-    }
-    //write to file
     fprintf(log_file, "=== TOP 5 SCORES ===\n");
     for (int i = 0; i < 5; i++){
-        if (top5[i].client_id != 0){
-            fprintf(log_file, "Client %d: %d points\n", top5[i].client_id, top5[i]. points);
+        if (best_clients[i].client_id != 0){
+            fprintf(log_file, "Client %d: %d points\n", best_clients[i].client_id, best_clients[i].points);
         }
     }
     pthread_mutex_unlock(&clients_mutex);
