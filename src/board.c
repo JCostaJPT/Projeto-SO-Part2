@@ -455,7 +455,7 @@ int load_pacman(board_t* board) {
     board->pacmans[0].pos_y = 1;
     board->pacmans[0].alive = 1;
     board->pacmans[0].points = 0;
-        direction = directions[rand() % 4]; // pick a random move from W, S, A, D
+    return 0;
 }
 
 // Static Loading
