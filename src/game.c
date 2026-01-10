@@ -8,6 +8,7 @@
 #include <ctype.h>
 #include <time.h>
 #include <stdbool.h>
+#include <stdio.h>
 #include <sys/types.h>
 #include <dirent.h>
 #include <unistd.h>
@@ -18,26 +19,29 @@
 #include <signal.h>
 #include <semaphore.h>
 
-#define CONTINUE_PLAY 0
-#define NEXT_LEVEL 1
-#define QUIT_GAME 2
-#define LOAD_BACKUP 3
-#define CREATE_BACKUP 4
 #define MAX_CLIENTS 25
 #define BUFFER_SIZE 25
-
-static const char *LEVEL_FILES[] = {"1.lvl", "2.lvl"};
-static const int NUM_LEVELS = 2;
-
-typedef struct {
-    board_t *board;
-    int ghost_index;
-} ghost_thread_arg_t;
 
 typedef struct{
     int client_id;
     int points;
 } client_info_t;
+
+typedef struct {
+    board_t *board;
+    int session_id;
+    int stop;
+    pthread_mutex_t cmd_lock;
+    char pending_cmd;
+} session_runtime_t;
+
+static void* pacman_thread(void *arg);
+static void* ghost_thread(void *arg);
+
+typedef struct {
+    session_runtime_t *runtime;
+    int ghost_index;
+} ghost_thread_arg_t;
 
 typedef struct {
     int req_fd;
@@ -60,13 +64,9 @@ client_info_t best_clients[5];
 pthread_mutex_t clients_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 static void update_best_clients(int client_id, int points) {
-    // Update existing entry if present
     for (int i = 0; i < 5; i++) {
         if (best_clients[i].client_id == client_id) {
-            if (points > best_clients[i].points) {
-                best_clients[i].points = points;
-            }
-            // Reorder if needed
+            if (points > best_clients[i].points) best_clients[i].points = points;
             for (int j = i; j > 0; j--) {
                 if (best_clients[j].points > best_clients[j-1].points) {
                     client_info_t tmp = best_clients[j-1];
@@ -77,14 +77,10 @@ static void update_best_clients(int client_id, int points) {
             return;
         }
     }
-
-    // Insert if better than current entries
     if (points <= 0) return;
     for (int i = 0; i < 5; i++) {
         if (best_clients[i].client_id == 0 || points > best_clients[i].points) {
-            for (int k = 4; k > i; k--) {
-                best_clients[k] = best_clients[k-1];
-            }
+            for (int k = 4; k > i; k--) best_clients[k] = best_clients[k-1];
             best_clients[i].client_id = client_id;
             best_clients[i].points = points;
             break;
@@ -139,12 +135,13 @@ int buffer_in = 0, buffer_out = 0;
 sem_t empty, full;
 pthread_mutex_t buffer_mutex = PTHREAD_MUTEX_INITIALIZER;
 
-int thread_shutdown = 0;
 static pthread_mutex_t sessions_lock = PTHREAD_MUTEX_INITIALIZER;
 static int active_sessions = 0;
+static pthread_cond_t sessions_cv = PTHREAD_COND_INITIALIZER;
 static void dec_sessions(void) {
     pthread_mutex_lock(&sessions_lock);
     active_sessions--;
+    pthread_cond_signal(&sessions_cv);
     pthread_mutex_unlock(&sessions_lock);
 }
 
@@ -156,6 +153,36 @@ static int count_remaining_dots(board_t *board) {
         }
     }
     return dots;
+}
+
+static int load_levels_list(const char *levels_dir, char level_files[][256], int max_levels) {
+    DIR *d = opendir(levels_dir);
+    if (!d) return 0;
+    struct dirent *de;
+    int count = 0;
+    while ((de = readdir(d)) != NULL) {
+        const char *name = de->d_name;
+        size_t len = strlen(name);
+        if (len > 4 && strcmp(name + len - 4, ".lvl") == 0) {
+            if (count < max_levels) {
+                strncpy(level_files[count], name, 255);
+                level_files[count][255] = '\0';
+                count++;
+            }
+        }
+    }
+    closedir(d);
+    for (int i = 0; i < count; i++) {
+        for (int j = i + 1; j < count; j++) {
+            if (strcmp(level_files[i], level_files[j]) > 0) {
+                char tmp[256];
+                strncpy(tmp, level_files[i], 256);
+                strncpy(level_files[i], level_files[j], 256);
+                strncpy(level_files[j], tmp, 256);
+            }
+        }
+    }
+    return count;
 }
 
 static int send_board_update(int notif_fd, board_t *board) {
@@ -231,73 +258,105 @@ static void* session_thread(void *arg) {
     sigset_t mask;
     sigemptyset (&mask);
     sigaddset(&mask, SIGUSR1);
-    pthread_sigmask(SIG_BLOCK, &mask, NULL);      
+    pthread_sigmask(SIG_BLOCK, &mask, NULL);      // gameplay threads ignore SIGUSR1
 
 
     int carry_points = 0;
+    char level_files[MAX_LEVELS][256];
+    int num_levels = load_levels_list(ctx->levels_dir, level_files, MAX_LEVELS);
+    if (num_levels == 0) {
+        fprintf(stderr, "[server] session %d found no levels in %s\n", ctx->session_id, ctx->levels_dir);
+        goto cleanup;
+    }
 
-    for (int level_idx = 0; level_idx < NUM_LEVELS; level_idx++) {
+    for (int level_idx = 0; level_idx < num_levels; level_idx++) {
         board_t board;
         memset(&board, 0, sizeof(board));
 
-        if (load_level(&board, (char *)LEVEL_FILES[level_idx], ctx->levels_dir, carry_points) != 0) {
-            fprintf(stderr, "[server] session %d failed to load level %s\n", ctx->session_id, LEVEL_FILES[level_idx]);
+        if (load_level(&board, level_files[level_idx], ctx->levels_dir, carry_points) != 0) {
+            fprintf(stderr, "[server] session %d failed to load level %s\n", ctx->session_id, level_files[level_idx]);
             goto cleanup;
         }
 
         fprintf(stderr, "[server] session %d level loaded: %s (%dx%d) tempo=%d dots=%d\n",
                 ctx->session_id, board.level_name, board.width, board.height, board.tempo, count_remaining_dots(&board));
 
-        // Main session loop for this level
-        while (!board.game_over && !board.victory) {
+        session_runtime_t rt = {
+            .board = &board,
+            .session_id = ctx->session_id,
+            .stop = 0,
+            .pending_cmd = 0
+        };
+        pthread_mutex_init(&rt.cmd_lock, NULL);
+
+        pthread_t pac_thread;
+        pthread_create(&pac_thread, NULL, pacman_thread, &rt);
+
+        pthread_t ghost_threads[MAX_GHOSTS];
+        int ghost_thread_count = 0;
+        for (int g = 0; g < board.n_ghosts; g++) {
+            ghost_thread_arg_t *garg = malloc(sizeof(ghost_thread_arg_t));
+            if (!garg) continue;
+            garg->runtime = &rt;
+            garg->ghost_index = g;
+            pthread_create(&ghost_threads[ghost_thread_count++], NULL, ghost_thread, garg);
+        }
+
+        while (!rt.stop) {
             char buf[32];
             ssize_t n = read(ctx->req_fd, buf, sizeof(buf));
             if (n == 0) {
-                board.game_over = 1; // client closed
+                // Client side closed the request pipe
+                pthread_rwlock_wrlock(&board.state_lock);
+                board.game_over = 1;
+                pthread_rwlock_unlock(&board.state_lock);
+                rt.stop = 1;
             } else if (n > 0) {
-                fprintf(stderr, "[server] session %d got %zd bytes from client\n", ctx->session_id, n);
+                // Commands arrive as opcode + payload pairs
                 for (ssize_t i = 0; i + 1 < n; i += 2) {
-                    if (buf[i] != OP_CODE_PLAY) continue;
-                    char cmd = toupper(buf[i + 1]);
-                    pthread_rwlock_wrlock(&board.state_lock);
-                    move_t res = move_pacman(&board, 0, &(command_t){.command = cmd, .turns = 1, .turns_left = 1});
-                    if (res == DEAD_PACMAN) {
+                    if (buf[i] == OP_CODE_PLAY) {
+                        char cmd = toupper(buf[i + 1]);
+                        pthread_mutex_lock(&rt.cmd_lock);
+                        rt.pending_cmd = cmd;
+                        pthread_mutex_unlock(&rt.cmd_lock);
+                    } else if (buf[i] == OP_CODE_DISCONNECT) {
+                        pthread_rwlock_wrlock(&board.state_lock);
                         board.game_over = 1;
-                    } else if (res == REACHED_PORTAL) {
-                        board.victory = 1;
+                        pthread_rwlock_unlock(&board.state_lock);
+                        rt.stop = 1;
                     }
-                    pthread_rwlock_unlock(&board.state_lock);
                 }
             }
 
-            pthread_rwlock_wrlock(&board.state_lock);
-            // Move ghosts each tick
-            for (int g = 0; g < board.n_ghosts; g++) {
-                move_ghost(&board, g, &board.ghosts[g].moves[board.ghosts[g].current_move % board.ghosts[g].n_moves]);
-            }
-            // Victory check by dots
-            if (count_remaining_dots(&board) == 0) {
-                board.victory = 1;
-            }
-            pthread_rwlock_unlock(&board.state_lock);
-
             pthread_rwlock_rdlock(&board.state_lock);
             int points_snapshot = board.accumulated_points;
+            int victory = board.victory;
+            int game_over = board.game_over;
             if (send_board_update(ctx->notif_fd, &board) == -1 && errno == EPIPE) {
                 pthread_rwlock_unlock(&board.state_lock);
-                board.game_over = 1;
+                rt.stop = 1;
                 break; // client closed pipe
             }
             pthread_rwlock_unlock(&board.state_lock);
 
             update_client_points(ctx->session_id, points_snapshot);
 
+            if (victory || game_over) {
+                rt.stop = 1;
+                break;
+            }
+
             sleep_ms(board.tempo);
         }
 
-        // Finished this level: send final board for this level
+        rt.stop = 1;
+        pthread_join(pac_thread, NULL);
+        for (int g = 0; g < ghost_thread_count; g++) {
+            pthread_join(ghost_threads[g], NULL);
+        }
+
         pthread_rwlock_rdlock(&board.state_lock);
-        int has_next = (level_idx + 1) < NUM_LEVELS;
+        int has_next = (level_idx + 1) < num_levels;
         if (board.victory && has_next) {
             board.game_over = 0; // signal transition, not final game over
         } else {
@@ -306,13 +365,14 @@ static void* session_thread(void *arg) {
         int points_snapshot = board.accumulated_points;
         if (send_board_update(ctx->notif_fd, &board) == -1 && errno == EPIPE) {
             pthread_rwlock_unlock(&board.state_lock);
-            break;
+        } else {
+            pthread_rwlock_unlock(&board.state_lock);
         }
-        pthread_rwlock_unlock(&board.state_lock);
 
         update_client_points(ctx->session_id, points_snapshot);
 
         carry_points = board.accumulated_points;
+        pthread_mutex_destroy(&rt.cmd_lock);
         unload_level(&board);
 
         if (board.victory && has_next) {
@@ -331,132 +391,89 @@ cleanup:
     return NULL;
 }
 
-int create_backup() {
-    // clear the terminal for process transition
-    terminal_cleanup();
-
-    pid_t child = fork();
-
-    if(child != 0) {
-        if (child < 0) {
-            return -1;
-        }
-
-        return child;
-    } else {
-        debug("[%d] Created\n", getpid());
-
-        return 0;
-    }
-}
-
-void screen_refresh(board_t * game_board, int mode) {
-    debug("REFRESH\n");
-    draw_board(game_board, mode);
-    refresh_screen();     
-}
-
-void* ncurses_thread(void *arg) {
-    board_t *board = (board_t*) arg;
-    sleep_ms(board->tempo / 2);
-    while (true) {
-        sleep_ms(board->tempo);
-        pthread_rwlock_wrlock(&board->state_lock);
-        if (thread_shutdown) {
-            pthread_rwlock_unlock(&board->state_lock);
-            pthread_exit(NULL);
-        }
-        screen_refresh(board, DRAW_MENU);
-        pthread_rwlock_unlock(&board->state_lock);
-    }
-}
-
 void* pacman_thread(void *arg) {
-    board_t *board = (board_t*) arg;
+    session_runtime_t *rt = (session_runtime_t *)arg;
+    board_t *board = rt->board;
+    pacman_t *pacman = &board->pacmans[0];
 
-    pacman_t* pacman = &board->pacmans[0];
-
-    int *retval = malloc(sizeof(int));
-
-    while (true) {
-        if(!pacman->alive) {
-            *retval = LOAD_BACKUP;
-            return (void*) retval;
-        }
-
+    while (!rt->stop) {
         sleep_ms(board->tempo * (1 + pacman->passo));
 
-        command_t* play;
+        pthread_rwlock_wrlock(&board->state_lock);
+        if (rt->stop || board->game_over || board->victory || !pacman->alive) {
+            pthread_rwlock_unlock(&board->state_lock);
+            break;
+        }
+
+        command_t *play;
         command_t c;
         if (pacman->n_moves == 0) {
-            c.command = get_input();
+            pthread_mutex_lock(&rt->cmd_lock);
+            char cmd = rt->pending_cmd;
+            rt->pending_cmd = 0;
+            pthread_mutex_unlock(&rt->cmd_lock);
 
-            if(c.command == '\0') {
+            if (cmd == '\0') {
+                pthread_rwlock_unlock(&board->state_lock);
                 continue;
             }
+            if (cmd == 'Q') {
+                board->game_over = 1;
+                rt->stop = 1;
+                pthread_rwlock_unlock(&board->state_lock);
+                break;
+            }
 
+            // Manual control: build a single-move command on the fly
+            c.command = cmd;
             c.turns = 1;
+            c.turns_left = 1;
             play = &c;
+        } else {
+            play = &pacman->moves[pacman->current_move % pacman->n_moves];
         }
-        else {
-            play = &pacman->moves[pacman->current_move%pacman->n_moves];
-        }
-
-        debug("KEY %c\n", play->command);
-
-        // QUIT
-        if (play->command == 'Q') {
-            *retval = QUIT_GAME;
-            return (void*) retval;
-        }
-        // FORK
-        if (play->command == 'G') {
-            *retval = CREATE_BACKUP;
-            return (void*) retval;
-        }
-
-        pthread_rwlock_rdlock(&board->state_lock);
 
         int result = move_pacman(board, 0, play);
         if (result == REACHED_PORTAL) {
-            // Next level
-            *retval = NEXT_LEVEL;
-            break;
+            board->victory = 1;
+            rt->stop = 1;
+        } else if (result == DEAD_PACMAN) {
+            board->game_over = 1;
+            rt->stop = 1;
+        } else if (!board->victory && !board->game_over && count_remaining_dots(board) == 0) {
+            board->victory = 1;
+            rt->stop = 1;
         }
-
-        if(result == DEAD_PACMAN) {
-            // Restart from child, wait for child, then quit
-            *retval = LOAD_BACKUP;
-            break;
-        }
-
         pthread_rwlock_unlock(&board->state_lock);
     }
-    pthread_rwlock_unlock(&board->state_lock);
-    return (void*) retval;
+    return NULL;
 }
 
 void* ghost_thread(void *arg) {
     ghost_thread_arg_t *ghost_arg = (ghost_thread_arg_t*) arg;
-    board_t *board = ghost_arg->board;
+    session_runtime_t *rt = ghost_arg->runtime;
     int ghost_ind = ghost_arg->ghost_index;
-
+    board_t *board = rt->board;
     free(ghost_arg);
 
-    ghost_t* ghost = &board->ghosts[ghost_ind];
-
-    while (true) {
+    while (!rt->stop) {
+        ghost_t *ghost = &board->ghosts[ghost_ind];
         sleep_ms(board->tempo * (1 + ghost->passo));
 
-        pthread_rwlock_rdlock(&board->state_lock);
-        if (thread_shutdown) {
+        pthread_rwlock_wrlock(&board->state_lock);
+        if (rt->stop || board->game_over || board->victory) {
             pthread_rwlock_unlock(&board->state_lock);
-            pthread_exit(NULL);
+            break;
         }
 
-        move_ghost(board, ghost_ind, &ghost->moves[ghost->current_move%ghost->n_moves]);
+        int res = move_ghost(board, ghost_ind, &ghost->moves[ghost->current_move % ghost->n_moves]);
+        if (res == DEAD_PACMAN) {
+            board->game_over = 1;
+            rt->stop = 1;
+        }
         pthread_rwlock_unlock(&board->state_lock);
     }
+    return NULL;
 }
 
 void* manager_thread_func(void *arg) {
@@ -474,7 +491,7 @@ void* manager_thread_func(void *arg) {
         active_sessions++;
         pthread_mutex_unlock(&sessions_lock);
 
-        // Handle the session
+        // Handle the session pulled from the queue
         session_thread(ctx);
     }
     return NULL;
@@ -482,6 +499,10 @@ void* manager_thread_func(void *arg) {
 
 void* host_thread_func(void *arg) {
     host_ctx_t *host_ctx = (host_ctx_t *)arg;
+    sigset_t mask;
+    sigemptyset(&mask);
+    sigaddset(&mask, SIGUSR1);
+    pthread_sigmask(SIG_UNBLOCK, &mask, NULL);
     char *fifo_registo = host_ctx->fifo_registo;
     // Open FIFO in RDWR to keep both ends open and avoid ENXIO
     int reg_fd = open(fifo_registo, O_RDWR);
@@ -524,6 +545,12 @@ void* host_thread_func(void *arg) {
             fprintf(stderr, "[server] invalid pipe name %s\n", req_pipe);
             continue;
         }
+
+        pthread_mutex_lock(&sessions_lock);
+        while (active_sessions >= host_ctx->max_games) {
+            pthread_cond_wait(&sessions_cv, &sessions_lock);
+        }
+        pthread_mutex_unlock(&sessions_lock);
 
         int notif_fd = open(notif_pipe, O_WRONLY);
         if (notif_fd == -1) {
@@ -574,17 +601,29 @@ static void sigusr1_handler (int sig){
     FILE *log_file = fopen("scores.log","w");
     if (!log_file) return;
 
-    //lock mutex to safely read best clients
+    //lock mutex to safely read active clients
     pthread_mutex_lock(&clients_mutex);
 
-    fprintf(log_file, "=== TOP 5 SCORES ===\n");
-    for (int i = 0; i < 5; i++){
-        if (best_clients[i].client_id != 0){
-            fprintf(log_file, "Client %d: %d points\n", best_clients[i].client_id, best_clients[i].points);
+    client_info_t top5[5] = {0};
+    for (int i = 0; i < num_active_clients; i++) {
+        for (int j = 0; j < 5; j++) {
+            if (active_clients[i].points > top5[j].points) {
+                for (int k = 4; k > j; k--) top5[k] = top5[k-1];
+                top5[j] = active_clients[i];
+                break;
+            }
         }
     }
+
+        fprintf(log_file, "=== TOP 5 CLIENTS ===\n");
+        for (int i = 0; i < 5; i++) {
+            if (best_clients[i].client_id != 0) {
+                fprintf(log_file, "Client %d: %d points\n", best_clients[i].client_id, best_clients[i].points);
+            }
+        }
+
     pthread_mutex_unlock(&clients_mutex);
-    fclose(log_file);
+    fclose(log_file); // log done
 }
 
 int main(int argc, char** argv) {
@@ -602,6 +641,12 @@ int main(int argc, char** argv) {
     // Avoid crashing on write to closed FIFOs
     signal(SIGPIPE, SIG_IGN);
     signal(SIGUSR1, sigusr1_handler);
+
+    // Block SIGUSR1 in all threads by default; host thread will unblock it
+    sigset_t block_all;
+    sigemptyset(&block_all);
+    sigaddset(&block_all, SIGUSR1);
+    pthread_sigmask(SIG_BLOCK, &block_all, NULL);
 
     // Create FIFO de registo (remove stale one first)
     unlink(fifo_registo);

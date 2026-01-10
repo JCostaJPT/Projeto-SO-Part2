@@ -87,7 +87,7 @@ int read_level(board_t* board, char* filename, char* dirname) {
         return -1;
     }
     
-    // the end of the file contains the grid
+    // The rest of the file is the grid layout
     board->board = calloc(board->width * board->height, sizeof(board_pos_t));
     board->pacmans = calloc(board->n_pacmans, sizeof(pacman_t));
     board->ghosts = calloc(board->n_ghosts, sizeof(ghost_t));
@@ -98,7 +98,7 @@ int read_level(board_t* board, char* filename, char* dirname) {
         if (command[0]== '#' || command[0] == '\0') continue;
         if (row >= board->height) break;
 
-        debug("Line: %s\n", command);
+        debug("Line: %s\n", command); // echo parsed row
 
         for (int col = 0; col < board -> width; col++){
             int idx = row * board->width + col;
@@ -207,8 +207,7 @@ int read_pacman(board_t* board, int points) {
             command[0] == 'W' ||
             command[0] == 'S' ||
             command[0] == 'R' ||
-            command[0] == 'G' ||  // FIXME: so para testar
-            command[0] == 'Q') {  // FIXME: so para testar
+            command[0] == 'Q') {
                 pacman->moves[move].command = command[0];
                 pacman->moves[move].turns = 1;
                 move += 1;

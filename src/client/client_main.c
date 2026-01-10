@@ -140,6 +140,11 @@ int main(int argc, char *argv[]) {
         if (command == '\0')
             continue;
 
+        if (command == 'G') {
+            // Backup command disabled in phase 2
+            continue;
+        }
+
         if (command == 'Q') {
             debug("Client pressed 'Q', quitting game\n");
             fprintf(stderr, "[client] quitting by user\n");
